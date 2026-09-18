@@ -33,6 +33,7 @@
   let wsShowWithSessions  = true; // true = With sessions only (default)
   let currentSort   = 'updatedAt|desc';
   let ctxSessionId  = null;
+  let ctxWorkspaceKey = null;
 
   // ── Init ───────────────────────────────────────────────────────────────────
   try {
@@ -50,7 +51,7 @@
     const msg = evt.data;
     if (msg.type === 'sessions') {
       allSessions = msg.items || [];
-      if (msg.discoveredWorkspaces && msg.discoveredWorkspaces.length > 0) {
+      if (Array.isArray(msg.discoveredWorkspaces)) {
         discoveredWorkspaces = msg.discoveredWorkspaces;
       }
       if (currentView === 'workspaces') {
@@ -58,6 +59,7 @@
       } else {
         renderSessions();
       }
+      syncExportScope();
       const totalSessions = allSessions.length;
       const totalWs = discoveredWorkspaces.length;
       setStatus(
@@ -109,6 +111,7 @@
   function showWorkspaceView() {
     currentView   = 'workspaces';
     selectedWsKey = null;
+    syncExportScope();
     document.getElementById('workspace-view').style.display = 'flex';
     document.getElementById('session-view').style.display   = 'none';
     renderWorkspaces();
@@ -126,7 +129,10 @@
 
     let workspaces;
     if (discoveredWorkspaces.length > 0) {
-      workspaces = discoveredWorkspaces.map(function (w) {
+      workspaces = discoveredWorkspaces.filter(function (w) {
+        return (w.folderPath || '').trim() !== ''
+          || (sessionCountByContext.get(normalizePath(w.hash)) || 0) > 0;
+      }).map(function (w) {
         // Match by normalised folderPath first; fall back to raw hash so that
         // sessions whose workspaceContext was set to the hash string are counted.
         const countByPath = sessionCountByContext.get(normalizePath(w.folderPath)) || 0;
@@ -136,8 +142,20 @@
           displayName: w.label,
           fullPath:    w.folderPath || w.hash,
           hash:        w.hash,
-          count:       countByPath || countByHash,
+          count:       countByPath + (normalizePath(w.folderPath) === normalizePath(w.hash) ? 0 : countByHash),
         };
+      });
+      // Include projects known only through Zed, JetBrains, or imported sessions.
+      const known = new Set();
+      workspaces.forEach(function (w) {
+        known.add(normalizePath(w.key));
+        if (w.hash) { known.add(normalizePath(w.hash)); }
+      });
+      groupByWorkspace(allSessions).forEach(function (w) {
+        if (!known.has(normalizePath(w.key))) {
+          workspaces.push({ key: w.key, displayName: w.displayName, fullPath: w.fullPath, hash: '', count: w.sessions.length });
+          known.add(normalizePath(w.key));
+        }
       });
       if (query) {
         workspaces = workspaces.filter(function (w) {
@@ -233,6 +251,7 @@
   // ── Session View ───────────────────────────────────────────────────────────
   function selectWorkspace(key) {
     selectedWsKey = key;
+    syncExportScope();
     currentView   = 'sessions';
     document.getElementById('workspace-view').style.display = 'none';
     document.getElementById('session-view').style.display   = 'flex';
@@ -275,6 +294,23 @@
   document.getElementById('workspace-list').addEventListener('click', function (e) {
     var btn = e.target.closest('[data-key]');
     if (btn) { selectWorkspace(btn.dataset.key); }
+  });
+
+  const workspaceList = document.getElementById('workspace-list');
+  workspaceList.addEventListener('contextmenu', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    const item = e.target.closest('.ws-item[data-key]');
+    if (item) { showWorkspaceCtx(item.dataset.key, e.clientX, e.clientY); }
+    else { hideCtx(); }
+  });
+  workspaceList.addEventListener('keydown', function (e) {
+    if (e.key !== 'ContextMenu' && !(e.key === 'F10' && e.shiftKey)) { return; }
+    const item = e.target.closest('.ws-item[data-key]');
+    if (!item) { return; }
+    e.preventDefault();
+    const rect = item.getBoundingClientRect();
+    showWorkspaceCtx(item.dataset.key, rect.left, rect.bottom);
   });
 
   // Session list: delegated click + contextmenu
@@ -327,43 +363,71 @@
   document.getElementById('ctx-sum-short').addEventListener('click',  function () { vscode.postMessage({ type: 'summarizeShort',   sessionId: ctxSessionId }); hideCtx(); });
   document.getElementById('ctx-sum-detail').addEventListener('click', function () { vscode.postMessage({ type: 'summarizeDetailed', sessionId: ctxSessionId }); hideCtx(); });
   document.getElementById('ctx-export').addEventListener('click',     function () { vscode.postMessage({ type: 'exportSession',    sessionId: ctxSessionId }); hideCtx(); });
+  document.getElementById('ctx-export-workspace').addEventListener('click', function () {
+    if (ctxWorkspaceKey === null) { return; }
+    const sessionIds = getWorkspaceSessions(ctxWorkspaceKey).map(function (s) { return s.id; });
+    vscode.postMessage({ type: 'exportWorkspace', sessionIds: sessionIds });
+    hideCtx();
+  });
   document.addEventListener('click',   function (e) { if (!ctxMenu.contains(e.target)) { hideCtx(); } });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape') { hideCtx(); } });
 
   function showCtx(sessionId, x, y) {
+    ctxWorkspaceKey = null;
+    setContextMode(false);
     ctxSessionId = sessionId;
     ctxMenu.style.left = Math.min(x, window.innerWidth - 200) + 'px';
     ctxMenu.style.top  = Math.min(y, window.innerHeight - 160) + 'px';
     ctxMenu.classList.add('open');
     document.getElementById('ctx-view').focus();
   }
-  function hideCtx() { ctxMenu.classList.remove('open'); ctxSessionId = null; }
+  function setContextMode(workspace) {
+    ['ctx-view', 'ctx-sum-short', 'ctx-sum-detail', 'ctx-export'].forEach(function (id) {
+      document.getElementById(id).style.display = workspace ? 'none' : '';
+    });
+    document.getElementById('ctx-export-workspace').style.display = workspace ? '' : 'none';
+  }
+  function showWorkspaceCtx(key, x, y) {
+    ctxSessionId = null;
+    ctxWorkspaceKey = key;
+    setContextMode(true);
+    ctxMenu.classList.add('open');
+    ctxMenu.style.left = Math.max(0, Math.min(x, window.innerWidth - ctxMenu.offsetWidth)) + 'px';
+    ctxMenu.style.top = Math.max(0, Math.min(y, window.innerHeight - ctxMenu.offsetHeight)) + 'px';
+    document.getElementById('ctx-export-workspace').focus();
+  }
+  function hideCtx() {
+    ctxMenu.classList.remove('open');
+    ctxSessionId = null;
+    ctxWorkspaceKey = null;
+  }
 
   // ── Session rendering ──────────────────────────────────────────────────────
+  function getWorkspaceSessions(key) {
+    if (!key || key === '__all__') { return allSessions; }
+    const normKey = normalizePath(key);
+    const wsEntry = discoveredWorkspaces.find(function (w) {
+      return normalizePath(w.folderPath || '') === normKey
+          || normalizePath(w.hash) === normKey;
+    });
+    const wsHash = wsEntry && wsEntry.hash ? wsEntry.hash.toLowerCase() : null;
+    return allSessions.filter(function (s) {
+      const sk = wsKey(s);
+      return normalizePath(sk) === normKey || (wsHash && sk.toLowerCase() === wsHash);
+    });
+  }
+
+  function syncExportScope() {
+    vscode.postMessage({
+      type: 'exportScope',
+      sessionIds: selectedWsKey && selectedWsKey !== '__all__'
+        ? getWorkspaceSessions(selectedWsKey).map(function (s) { return s.id; })
+        : null,
+    });
+  }
+
   function getVisibleSessions() {
-    let sessions = allSessions;
-    if (selectedWsKey && selectedWsKey !== '__all__') {
-      const normKey = normalizePath(selectedWsKey);
-      // Also find the workspace entry so we can match sessions stored with only
-      // the workspace hash as their workspaceContext (V5 / modern format).
-      const wsEntry = discoveredWorkspaces.find(function (w) {
-        return normalizePath(w.folderPath || '') === normKey
-            || w.hash === selectedWsKey
-            || normalizePath(w.hash) === normKey;
-      });
-      const wsHash = wsEntry ? wsEntry.hash.toLowerCase() : null;
-      sessions = sessions.filter(function (s) {
-        const sk = wsKey(s);
-        const m = normalizePath(sk) === normKey
-               || sk === selectedWsKey
-               || (wsHash && sk.toLowerCase() === wsHash);
-        if (!m) {
-          console.log('[CSB] SKIP session ws="' + sk + '" normsk="' + normalizePath(sk) + '" normKey="' + normKey + '" wsHash="' + wsHash + '"');
-        }
-        return m;
-      });
-      console.log('[CSB] getVisibleSessions: selectedWsKey="' + selectedWsKey + '" normKey="' + normKey + '" wsHash="' + wsHash + '" matched=' + sessions.length + '/' + allSessions.length);
-    }
+    let sessions = getWorkspaceSessions(selectedWsKey);
     const now = Date.now(), DAY = 86400000;
     sessions = sessions.filter(function (s) {
       if (activePeriod === 'today')    { return now - new Date(s.updatedAt).getTime() <= DAY; }

@@ -57,6 +57,8 @@ npm test
 | `parser.test.ts` | Schema adapters V1/V2/V4, date parsing, code-block extraction, and resilience to unknown schemas |
 | `redactor.test.ts` | All redaction pattern matches; safe text left untouched; file-path redaction |
 | `exporter.test.ts` | JIRA/MD/JSON output formatting; round-trip JSON re-import; secret redaction; code-block toggle |
+| Export All tests in `exporter.test.ts` | Multi-session JSON round-trip, combined Markdown, redaction, empty collections, and invalid collection entries |
+| `batchExport.test.ts` | Selected-session files, collision-safe names, redaction, Markdown options, partial failures, and empty batches |
 
 ---
 
@@ -144,6 +146,7 @@ It tries four strategies in order:
 | V2 | `{ conversations: [{ turns: [] }] }` | Newer Copilot Chat |
 | V3 | `{ chatSessions: [{ entries: [] }] }` | Panel chat variant |
 | V4 | `{ id, messages: [] }` | Extension's own JSON export (round-trip re-import) |
+| V4 collection | `{ schemaVersion: "4", exportedAt, sessions: [{ id, messages: [] }] }` | Export All JSON; each entry is a normalized V4 session |
 | V5 | `{ version: 1, entries: { "<uuid>": { sessionId, … } } }` | Modern Copilot Chat (≥ v1.200), SQLite-only. Title and timing come from `chat.ChatSessionStore.index`; transcript from per-session JSONL files. |
 
 ---

@@ -1,14 +1,18 @@
 import * as vscode from 'vscode';
+import { randomUUID } from 'crypto';
 import { DiscoveryService } from './services/discoveryService';
 import { ParserService } from './services/parserService';
 import { IndexService } from './services/indexService';
+import { defaultVisualStudioPaths } from './services/visualStudioSessionService';
+import { ExternalSessionService, defaultExternalPaths } from './services/externalSessionService';
 import { ExporterService } from './services/exporterService';
+import { exportSessionFiles } from './services/batchExportService';
 import { SessionListProvider } from './providers/sessionListProvider';
 import { TranscriptPanel } from './panels/transcriptPanel';
 import { SummaryPanel } from './panels/summaryPanel';
 import { PreviewPanel } from './panels/previewPanel';
 import { DiagnosticsPanel } from './panels/diagnosticsPanel';
-import { ExportFormat, SummaryOptions } from './models/types';
+import { ExportFormat, ExportOptions, SummaryOptions, SessionWithMessages } from './models/types';
 
 // ── Singletons ────────────────────────────────────────────────────────────────
 
@@ -66,6 +70,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
     vscode.commands.registerCommand('copilotSessionBrowser.importSession', () =>
       cmdImport()),
+
+    vscode.commands.registerCommand('copilotSessionBrowser.exportSessions', (sessionIds?: string[]) =>
+      cmdExportSessions(sessionIds ?? listProvider.getExportSessionIds())),
 
     vscode.commands.registerCommand('copilotSessionBrowser.diagnostics', () =>
       cmdDiagnostics(context)),
@@ -188,6 +195,13 @@ async function cmdRefresh(context: vscode.ExtensionContext): Promise<void> {
       }
     }
 
+    const external = await externalCollector(context).collect();
+    totalAdded += index.upsertAll(external.sessions).added;
+    for (const error of external.errors) { SessionListProvider.log(`EXTERNAL: ${error}`); }
+    if (external.errors.length) {
+      void vscode.window.showWarningMessage(`Some IDE sessions could not be fully loaded (${external.errors.length} issues). See Diagnostics.`);
+    }
+
     // Restore any previously imported sessions from extension storage
     const imported = context.globalState.get<string>('importedSessions');
     if (imported) {
@@ -288,13 +302,144 @@ async function cmdExport(sessionId: string | undefined, context: vscode.Extensio
     return;
   }
 
+  const options = await promptExportOptions();
+  if (!options) {
+    return;
+  }
+
+  const resolvedRoleFilter = (roleFilter === 'user' || roleFilter === 'assistant') ? roleFilter : 'all';
+  PreviewPanel.openOrReveal(
+    session,
+    { ...options, roleFilter: resolvedRoleFilter },
+    context.extensionUri,
+    vscode.ViewColumn.Two,
+  );
+}
+
+async function cmdExportSessions(sessionIds?: string[]): Promise<void> {
+  const includedIds = sessionIds === undefined ? undefined : new Set(sessionIds);
+  const sessions = index.query({}, 'updatedAt', 'desc')
+    .filter(session => includedIds === undefined || includedIds.has(session.id));
+  if (sessions.length === 0) {
+    void vscode.window.showInformationMessage('No sessions available to export. Try refreshing.');
+    return;
+  }
+  const picked = await vscode.window.showQuickPick(
+    sessions.map(session => ({
+      label: session.title || 'Untitled session',
+      description: session.workspaceContext,
+      detail: `${session.updatedAt.toLocaleString()} · ${session.messageCount} messages · ${session.id}`,
+      picked: true,
+      session,
+    })),
+    {
+      title: includedIds === undefined ? 'Select sessions to export' : 'Select workspace sessions to export',
+      placeHolder: 'All sessions are selected. Keep all or check only the sessions to export',
+      canPickMany: true,
+      matchOnDescription: true,
+      matchOnDetail: true,
+    },
+  );
+  if (!picked || picked.length === 0) {
+    return;
+  }
+  await cmdExportBatch(picked.map(item => item.session), includedIds === undefined && picked.length === sessions.length ? 'all' : 'selected');
+}
+
+async function cmdExportBatch(sessions: SessionWithMessages[], scope: 'all' | 'selected'): Promise<void> {
+  if (sessions.length === 0) {
+    void vscode.window.showInformationMessage('No sessions loaded. Try refreshing.');
+    return;
+  }
+
+  const options = await promptExportOptions(`Export ${sessions.length} ${scope} sessions`);
+  if (!options) {
+    return;
+  }
+
+  const layout = await vscode.window.showQuickPick([
+    { label: 'One combined file', description: 'Bundle all chosen sessions into one file', value: 'combined' },
+    { label: 'Separate files in a folder', description: 'Choose a folder; create a new export subfolder', value: 'folder' },
+  ], { title: 'Export layout' });
+  if (!layout) {
+    return;
+  }
+  if (layout.value === 'folder') {
+    await cmdExportFolder(sessions, options);
+    return;
+  }
+
+  const uri = await vscode.window.showSaveDialog({
+    title: `Export ${sessions.length} ${scope} sessions`,
+    defaultUri: vscode.Uri.file(
+      `copilot-${scope}-sessions-${new Date().toISOString().slice(0, 10)}${exporter.fileExtension(options.format)}`,
+    ),
+    filters: options.format === 'json' ? { JSON: ['json'] } : { Markdown: ['md'] },
+  });
+  if (!uri) {
+    return;
+  }
+
+  try {
+    await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: `Exporting ${sessions.length} sessions…`,
+    }, async () => {
+      const content = exporter.exportAll(sessions, options);
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
+    });
+    void vscode.window.showInformationMessage(`Exported ${sessions.length} sessions to ${uri.fsPath}`);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    void vscode.window.showErrorMessage(`Export failed: ${message}`);
+  }
+}
+
+async function cmdExportFolder(sessions: SessionWithMessages[], options: ExportOptions): Promise<void> {
+  const folders = await vscode.window.showOpenDialog({
+    title: 'Choose destination — a new export subfolder will be created',
+    openLabel: 'Export here',
+    canSelectFiles: false,
+    canSelectFolders: true,
+    canSelectMany: false,
+  });
+  if (!folders?.length) {
+    return;
+  }
+  const destination = vscode.Uri.joinPath(
+    folders[0], `copilot-export-${new Date().toISOString().slice(0, 10)}-${randomUUID()}`,
+  );
+  try {
+    const result = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: `Exporting ${sessions.length} sessions…`,
+    }, async progress => {
+      await vscode.workspace.fs.createDirectory(destination);
+      return exportSessionFiles(sessions, options, async (filename, content) => {
+        await vscode.workspace.fs.writeFile(vscode.Uri.joinPath(destination, filename), Buffer.from(content, 'utf-8'));
+      }, (completed, total) => progress.report({ increment: 100 / total, message: `${completed}/${total}` }));
+    });
+    if (result.failures.length > 0) {
+      void vscode.window.showErrorMessage(
+        `Exported ${result.saved}/${sessions.length} sessions to ${destination.fsPath}. ` +
+        `${result.failures.length} failed. First failure: ${result.failures[0].filename}: ${result.failures[0].message}`,
+      );
+    } else {
+      void vscode.window.showInformationMessage(`Exported ${result.saved} sessions to ${destination.fsPath}`);
+    }
+  } catch (err: unknown) {
+    void vscode.window.showErrorMessage(`Folder export failed at ${destination.fsPath}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+async function promptExportOptions(title = 'Select export format'): Promise<ExportOptions | undefined> {
   // Pick format
   const formatPick = await vscode.window.showQuickPick(
     [
       { label: '$(markdown) Standard Markdown', description: 'Full transcript as Markdown', value: 'markdown' as ExportFormat },
       { label: '$(json) JSON', description: 'Full session as normalized JSON (re-importable)', value: 'json' as ExportFormat },
     ],
-    { title: 'Select export format', placeHolder: 'Choose format…' },
+    { title, placeHolder: 'Choose format…' },
   );
   if (!formatPick) {
     return;
@@ -315,7 +460,10 @@ async function cmdExport(sessionId: string | undefined, context: vscode.Extensio
       ],
       { title: 'Secret redaction', placeHolder: `Default: ${redactByDefault ? 'ON' : 'OFF'}` },
     );
-    redactSecrets = redactPick?.value ?? redactByDefault;
+    if (!redactPick) {
+      return;
+    }
+    redactSecrets = redactPick.value;
 
     const codeBlocksPick = await vscode.window.showQuickPick(
       [
@@ -324,17 +472,13 @@ async function cmdExport(sessionId: string | undefined, context: vscode.Extensio
       ],
       { title: 'Code blocks', placeHolder: 'Choose…' },
     );
-    includeCodeBlocks = codeBlocksPick?.value ?? true;
+    if (!codeBlocksPick) {
+      return;
+    }
+    includeCodeBlocks = codeBlocksPick.value;
   }
 
-  // Open preview panel — user can copy or save from there
-  const resolvedRoleFilter = (roleFilter === 'user' || roleFilter === 'assistant') ? roleFilter : 'all';
-  PreviewPanel.openOrReveal(
-    session,
-    { format: formatPick.value, includeCodeBlocks, includeFilePaths: false, redactSecrets, roleFilter: resolvedRoleFilter },
-    context.extensionUri,
-    vscode.ViewColumn.Two,
-  );
+  return { format: formatPick.value, includeCodeBlocks, includeFilePaths: false, redactSecrets };
 }
 
 async function cmdImport(): Promise<void> {
@@ -388,10 +532,29 @@ async function cmdImport(): Promise<void> {
   }
 }
 
+function externalCollector(context: vscode.ExtensionContext): ExternalSessionService {
+  const cfg = vscode.workspace.getConfiguration('copilotSessionBrowser');
+  const defaults = defaultExternalPaths();
+  const vsDefaults = defaultVisualStudioPaths();
+  return new ExternalSessionService(context.extensionPath, {
+    zedDatabase: cfg.get<string>('zedDatabasePath', '') || defaults.zedDatabase,
+    jetbrainsSessionRoot: cfg.get<string>('jetbrainsSessionPath', '') || defaults.jetbrainsSessionRoot,
+  }, {
+    roots: [...new Set([...vsDefaults.roots, ...cfg.get<string[]>('visualStudioSearchPaths', []),
+      ...(vscode.workspace.workspaceFolders || []).filter(f => f.uri.scheme === 'file').map(f => f.uri.fsPath)])],
+    logDirectories: vsDefaults.logDirectories,
+  });
+}
+
 async function cmdDiagnostics(context: vscode.ExtensionContext): Promise<void> {
   listProvider.setStatusMessage('Running diagnostics…');
   try {
     const diagnostics = await discovery.getDiagnosticsInfo();
+    const external = await externalCollector(context).collect();
+    diagnostics.searchPaths.push(...external.searchPaths);
+    diagnostics.discoveredFiles.push(...external.discoveredFiles);
+    diagnostics.errors.push(...external.errors);
+    diagnostics.totalSessionsLoaded = index.count();
     DiagnosticsPanel.openOrReveal(diagnostics, context.extensionUri, vscode.ViewColumn.One);
     listProvider.setStatusMessage(`${index.count()} session(s) loaded`);
   } catch (err: unknown) {

@@ -15,7 +15,7 @@ export interface SqliteReadResult {
 // Module-level cache so we only initialise sql.js once per extension lifetime
 let _sqlJs: any = null;
 
-async function loadSqlJs(extensionPath: string): Promise<any> {
+export async function loadSqlJs(extensionPath: string): Promise<any> {
   if (_sqlJs) {
     return _sqlJs;
   }

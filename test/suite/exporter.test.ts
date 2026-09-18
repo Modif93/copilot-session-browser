@@ -20,6 +20,69 @@ const DEFAULT_OPTS = {
   redactSecrets: false,
 };
 
+describe('ExporterService – Export All', () => {
+  it('round-trips multiple sessions and their transcripts through one JSON file', () => {
+    const sessions = [loadSession('session-v1.json'), loadSession('session-v2.json')];
+    const output = exporter.exportAll(sessions, { ...DEFAULT_OPTS, format: 'json' });
+    const restored = parser.parseRaw(output, 'all-sessions.json');
+    assert.deepStrictEqual(restored.errors, []);
+    assert.strictEqual(restored.sessions.length, sessions.length);
+    for (const [i, session] of sessions.entries()) {
+      const actual = restored.sessions[i];
+      assert.strictEqual(actual.id, session.id);
+      assert.strictEqual(actual.title, session.title);
+      assert.strictEqual(actual.createdAt.toISOString(), session.createdAt.toISOString());
+      assert.deepStrictEqual(actual.tags, session.tags);
+      assert.deepStrictEqual(actual.messages, session.messages);
+    }
+  });
+
+  it('includes every session in Markdown and applies code-block exclusion', () => {
+    const sessions = [loadSession('session-v1.json'), loadSession('session-v2.json')];
+    const output = exporter.exportAll(sessions, {
+      ...DEFAULT_OPTS, format: 'markdown', includeCodeBlocks: false,
+    });
+    for (const session of sessions) {
+      assert.ok(output.includes(`# ${session.title}`));
+      assert.ok(output.includes(session.id));
+    }
+    assert.ok(!output.includes('```'));
+  });
+
+  it('redacts every session without mutating the source index', () => {
+    const session = loadSession('session-v2.json');
+    const sessions = [session, { ...session, id: 'second-session' }];
+    const before = JSON.stringify(sessions);
+    for (const format of ['json', 'markdown'] as const) {
+      const output = exporter.exportAll(sessions, { ...DEFAULT_OPTS, format, redactSecrets: true });
+      assert.ok(!output.includes('AKIAIOSFODNN7EXAMPLE'));
+      assert.ok(output.includes('[REDACTED'));
+    }
+    assert.strictEqual(JSON.stringify(sessions), before);
+  });
+
+  it('round-trips an empty collection and a session with no messages', () => {
+    const options = { ...DEFAULT_OPTS, format: 'json' as const };
+    const empty = parser.parseRaw(exporter.exportAll([], options), 'empty.json');
+    assert.deepStrictEqual(empty.errors, []);
+    assert.deepStrictEqual(empty.sessions, []);
+    const session = { ...loadSession('session-v1.json'), messages: [], messageCount: 0 };
+    const restored = parser.parseRaw(exporter.exportAll([session], options), 'empty-session.json');
+    assert.deepStrictEqual(restored.errors, []);
+    assert.strictEqual(restored.sessions.length, 1);
+    assert.strictEqual(restored.sessions[0].messageCount, 0);
+  });
+
+  it('reports invalid collection entries while retaining valid sessions', () => {
+    const session = loadSession('session-v1.json');
+    const data = JSON.parse(exporter.exportAll([session], { ...DEFAULT_OPTS, format: 'json' }));
+    data.sessions.push(null, { id: 'broken' });
+    const restored = parser.parseRaw(JSON.stringify(data), 'mixed.json');
+    assert.strictEqual(restored.sessions.length, 1);
+    assert.strictEqual(restored.errors.length, 2);
+  });
+});
+
 // ── Standard Markdown ─────────────────────────────────────────────────────────
 
 describe('ExporterService – Standard Markdown', () => {

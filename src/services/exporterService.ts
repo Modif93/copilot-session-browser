@@ -133,6 +133,23 @@ function toJson(session: SessionWithMessages, options: ExportOptions): string {
 // ── Public API ────────────────────────────────────────────────────────────────
 
 export class ExporterService {
+  /** Export the complete index as one document, using the single-session options. */
+  exportAll(sessions: SessionWithMessages[], options: ExportOptions): string {
+    if (options.format === 'json') {
+      return JSON.stringify({
+        schemaVersion: '4',
+        exportedAt: new Date().toISOString(),
+        sessions: sessions.map(session => JSON.parse(this.export(session, options))),
+      }, null, 2);
+    }
+
+    return [
+      '# Copilot Sessions',
+      `${sessions.length} session${sessions.length !== 1 ? 's' : ''}`,
+      ...sessions.map(session => this.export(session, options)),
+    ].join('\n\n---\n\n');
+  }
+
   export(session: SessionWithMessages, options: ExportOptions): string {
     switch (options.format) {
       case 'markdown':

@@ -1,4 +1,5 @@
 ﻿import * as vscode from 'vscode';
+import { visibleWorkspaces } from '../services/workspaceVisibility';
 import { IndexService } from '../services/indexService';
 import { SessionListItem, WorkspaceInfo } from '../models/types';
 
@@ -16,6 +17,11 @@ export class SessionListProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'copilotSessionBrowser.sessionList';
 
   private _view?: vscode.WebviewView;
+  private _exportSessionIds?: string[];
+
+  getExportSessionIds(): string[] | undefined {
+    return this._exportSessionIds;
+  }
   private _discoveredWorkspaces: WorkspaceInfo[] = [];
   private _workspaceScanner?: () => WorkspaceInfo[];
   private static _out: vscode.OutputChannel | undefined;
@@ -58,6 +64,8 @@ export class SessionListProvider implements vscode.WebviewViewProvider {
   ): void {
     SessionListProvider.log(`resolveWebviewView called — _workspaceScanner is ${this._workspaceScanner ? 'SET' : 'UNSET'}`);
     this._view = webviewView;
+    this._exportSessionIds = undefined;
+    webviewView.onDidDispose(() => { this._exportSessionIds = undefined; });
 
     webviewView.webview.options = {
       enableScripts: true,
@@ -99,6 +107,18 @@ export class SessionListProvider implements vscode.WebviewViewProvider {
             'copilotSessionBrowser.exportSession',
             msg.sessionId as string,
           );
+          break;
+        case 'exportScope':
+          if (msg.sessionIds === null) {
+            this._exportSessionIds = undefined;
+          } else if (Array.isArray(msg.sessionIds) && msg.sessionIds.every((id: unknown) => typeof id === 'string')) {
+            this._exportSessionIds = msg.sessionIds;
+          }
+          break;
+        case 'exportWorkspace':
+          if (Array.isArray(msg.sessionIds) && msg.sessionIds.every((id: unknown) => typeof id === 'string')) {
+            void vscode.commands.executeCommand('copilotSessionBrowser.exportSessions', msg.sessionIds);
+          }
           break;
         case 'refresh':
           void vscode.commands.executeCommand('copilotSessionBrowser.refresh');
@@ -156,7 +176,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider {
       items,
       tags,
       workspaces,
-      discoveredWorkspaces: this._discoveredWorkspaces,
+      discoveredWorkspaces: visibleWorkspaces(this._discoveredWorkspaces, sessions),
       count: items.length,
     });
   }
@@ -188,6 +208,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider {
     } else {
       SessionListProvider.log('_buildHtml: no scanner — wsJson will be []');
     }
+    initialWorkspaces = visibleWorkspaces(initialWorkspaces, this.index.getAll());
     const wsJson = JSON.stringify(initialWorkspaces);
 
     // ── Server-side render workspace list as real HTML ──────────────────────
@@ -576,6 +597,7 @@ export class SessionListProvider implements vscode.WebviewViewProvider {
 
   <!-- Shared context menu -->
   <div class="ctx-menu" id="ctx-menu" role="menu">
+    <button id="ctx-export-workspace" role="menuitem" style="display:none">💾 Export Workspace Sessions…</button>
     <button id="ctx-view" role="menuitem">🔍 View Transcript</button>
     <button id="ctx-sum-short" role="menuitem">📋 Summarize (Short)</button>
     <button id="ctx-sum-detail" role="menuitem">📄 Summarize (Detailed)</button>

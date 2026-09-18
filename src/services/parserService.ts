@@ -301,10 +301,10 @@ function parseV4(
     return null;
   }
 
-  const rawMessages = asArray<unknown>(data['messages']);
-  if (rawMessages.length === 0) {
+  if (!Array.isArray(data['messages'])) {
     return null;
   }
+  const rawMessages = asArray<unknown>(data['messages']);
 
   const sessionId = data['id'] as string;
   const messages: Message[] = rawMessages.filter(isObject).map(m => {
@@ -479,6 +479,21 @@ export class ParserService {
     }
 
     const obj = data as Record<string, unknown>;
+
+    // Export All stores normalized V4 sessions in a collection envelope.
+    if (obj['schemaVersion'] === '4' && Array.isArray(obj['sessions'])) {
+      const sessions: SessionWithMessages[] = [];
+      const errors: string[] = [];
+      for (const [i, entry] of obj['sessions'].entries()) {
+        const parsed = isObject(entry) ? parseV4(entry, filePath) : null;
+        if (parsed) {
+          sessions.push(...parsed);
+        } else {
+          errors.push(`Invalid session at index ${i} in exported collection`);
+        }
+      }
+      return { sessions, schemaVersion: 'v4', errors };
+    }
 
     for (const adapter of ADAPTERS) {
       const result = adapter(obj, filePath);
